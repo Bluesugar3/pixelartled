@@ -1,15 +1,18 @@
 """Eye blink display on 128x32 RGB matrix using a single USB camera.
 
 Environment variables (optional):
-  CAM_W, CAM_H          Capture resolution (default 320x240)
-  PROCESS_INTERVAL      Seconds between landmark runs (default 0.15)
-  SMOOTH_ALPHA          Exponential smoothing factor (default 0.3)
-  NO_PREVIEW=1          Disable OpenCV preview window
-  REFINE=1              Enable iris/extra landmarks (slower)
-  LED_INTERVAL          Minimum seconds between LED updates (default 0.07)
-  CAM_INDEX             Camera index (default 0)
-  LED_BRIGHTNESS        1..100 (default 70)
-	LED_SLOWDOWN          Multiplier to slow LED updates (default 1.0)
+	CAM_W, CAM_H          Capture resolution (default 160x120 lower = faster)
+	PROCESS_INTERVAL      Seconds between landmark runs (default 0.10 faster)
+	SMOOTH_ALPHA          Exponential smoothing factor (default 0.3)
+	NO_PREVIEW=1          Disable OpenCV preview window
+	REFINE=1              Enable iris/extra landmarks (slower)
+	LED_INTERVAL          Base seconds between LED pushes (default 0.07)
+	CAM_INDEX             Camera index (default 0)
+	LED_BRIGHTNESS        1..100 (default 70)
+	LED_SLOWDOWN          Multiplier to slow steady LED updates (default 1.5)
+	BLINK_LED_FACTOR      Multiplier (<1) to speed LED push during active blink (default 0.4)
+	BLINK_DELTA           Minimum ratio change to treat as fast blink (default 0.010)
+	BLINK_ACCEL=1         Enable frame skipping acceleration during rapid close/open
 """
 
 from PIL import Image
@@ -27,12 +30,15 @@ EYES_R = [im.transpose(Image.FLIP_LEFT_RIGHT) for im in EYES_L]
 # ------------------------------------------------------------
 # Config (env overrides)
 # ------------------------------------------------------------
-CAM_WIDTH  = int(os.environ.get("CAM_W", 320))
-CAM_HEIGHT = int(os.environ.get("CAM_H", 240))
-FRAME_INTERVAL = float(os.environ.get("PROCESS_INTERVAL", 0.15))
+CAM_WIDTH  = int(os.environ.get("CAM_W", 160))
+CAM_HEIGHT = int(os.environ.get("CAM_H", 120))
+FRAME_INTERVAL = float(os.environ.get("PROCESS_INTERVAL", 0.10))
 SMOOTH_ALPHA = float(os.environ.get("SMOOTH_ALPHA", 0.3))
 LED_MIN_INTERVAL = float(os.environ.get("LED_INTERVAL", 0.07))
-LED_SLOWDOWN = float(os.environ.get("LED_SLOWDOWN", 1.0))
+LED_SLOWDOWN = float(os.environ.get("LED_SLOWDOWN", 1.5))
+BLINK_LED_FACTOR = float(os.environ.get("BLINK_LED_FACTOR", 0.4))
+BLINK_DELTA = float(os.environ.get("BLINK_DELTA", 0.010))
+BLINK_ACCEL = os.environ.get("BLINK_ACCEL", "1") == "1"
 DISABLE_PREVIEW = os.environ.get("NO_PREVIEW", "0") == "1"
 REFINE_LANDMARKS = os.environ.get("REFINE", "0") == "1"
 CAM_INDEX = int(os.environ.get("CAM_INDEX", 0))
@@ -60,7 +66,7 @@ def classify_static(r):
 	"""Static fallback classification with fixed thresholds."""
 	return 0 if r>0.30 else 1 if r>0.24 else 2 if r>0.19 else 3
 
-def adaptive_index(ratio, history, prev_idx):
+def adaptive_index(ratio, history, prev_idx, prev_ratio=None):
 	"""Adaptive classification using dynamic min/max from recent history.
 
 	ratio: current (smoothed) openness metric.
@@ -91,14 +97,21 @@ def adaptive_index(ratio, history, prev_idx):
 	r_clamped = max(adj_min, min(adj_max, ratio))
 	n = (r_clamped - adj_min) / (adj_max - adj_min)
 
-	# Map normalized openness to frame index (optionally could add hysteresis using prev_idx)
-	if n >= 0.75:
-		return 0
-	if n >= 0.50:
-		return 1
-	if n >= 0.25:
-		return 2
-	return 3
+	# Map normalized openness to frame index baseline (open->closed)
+	if n >= 0.75: base = 0
+	elif n >= 0.50: base = 1
+	elif n >= 0.25: base = 2
+	else: base = 3
+
+	# Blink acceleration: if rapid change detected, move one extra frame toward direction
+	if prev_ratio is not None and prev_idx is not None:
+		delta = prev_ratio - ratio  # positive if closing
+		if BLINK_ACCEL:
+			if delta > BLINK_DELTA and base > prev_idx:
+				base = min(3, base + 1)
+			elif delta < -BLINK_DELTA and base < prev_idx:
+				base = max(0, base - 1)
+	return base
 
 def init_matrix():
 	opts = RGBMatrixOptions()
@@ -160,9 +173,10 @@ def main():
 	last_pair = (-1,-1)
 	smooth_l = smooth_r = None
 	prev_li = prev_ri = None
+	prev_ratio_l = prev_ratio_r = None
 	hist_l: list[float] = []
 	hist_r: list[float] = []
-	effective_interval = LED_MIN_INTERVAL * LED_SLOWDOWN
+	base_interval = LED_MIN_INTERVAL * LED_SLOWDOWN
 
 	while True:
 		ok, frame = cap.read()
@@ -186,11 +200,15 @@ def main():
 			else:
 				smooth_l = smooth_l*(1-SMOOTH_ALPHA) + lr*SMOOTH_ALPHA
 				smooth_r = smooth_r*(1-SMOOTH_ALPHA) + rr*SMOOTH_ALPHA
-			li = adaptive_index(smooth_l, hist_l, prev_li)
-			ri = adaptive_index(smooth_r, hist_r, prev_ri)
+			li = adaptive_index(smooth_l, hist_l, prev_li, prev_ratio_l)
+			ri = adaptive_index(smooth_r, hist_r, prev_ri, prev_ratio_r)
 		prev_li, prev_ri = li, ri
+		prev_ratio_l, prev_ratio_r = smooth_l, smooth_r
 
-		if (li,ri) != last_pair and (now - last_led_t) >= effective_interval:
+		# Blink-active = change in index; push faster with BLINK_LED_FACTOR
+		blink_active = (li,ri) != last_pair and (prev_li is not None and (li != prev_li or ri != prev_ri))
+		interval = base_interval if not blink_active else min(base_interval, LED_MIN_INTERVAL * BLINK_LED_FACTOR)
+		if (li,ri) != last_pair and (now - last_led_t) >= interval:
 			img = compose(li, ri)
 			if offscreen is not None:
 				try:
