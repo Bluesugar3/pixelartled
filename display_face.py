@@ -34,9 +34,13 @@ PROCESS_SCALE = float(os.environ.get("PROC_SCALE", 1.0))  # extra scale factor (
 
 opts = RGBMatrixOptions()
 opts.rows = 32
-opts.cols = 128            # if you actually have two 64x32 panels, use cols=64 and opts.chain_length = 2
+opts.cols = 128
 opts.hardware_mapping = "adafruit-hat"
-opts.no_hardware_pulse = True  # reduce CPU jitter
+# Replace the failing line:
+if hasattr(opts, "disable_hardware_pulsing"):
+    opts.disable_hardware_pulsing = True  # reduce CPU jitter
+elif hasattr(opts, "no_hardware_pulse"):
+    opts.no_hardware_pulse = True  # legacy name
 matrix = RGBMatrix(options=opts)
 
 # Damaged columns mitigation (e.g., broken capacitor causing green tint).
