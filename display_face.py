@@ -26,6 +26,13 @@ LED_MIN_INTERVAL = float(os.environ.get("LED_INTERVAL", 0.07))  # min seconds be
 CAM_INDEX = int(os.environ.get("CAM_INDEX", 0))
 DISABLE_GC = os.environ.get("DISABLE_GC", "1") == "1"
 RESIZE_INTERP = cv2.INTER_AREA if os.environ.get("RESIZE_NEAREST", "0") != "1" else cv2.INTER_NEAREST
+# Adaptive blink tuning (enable to auto-calibrate open eye baseline and use relative thresholds)
+DYNAMIC_THRESH = os.environ.get("DYNAMIC_THRESH", "1") == "1"
+BASELINE_ALPHA = float(os.environ.get("BASELINE_ALPHA", 0.05))  # smoothing for open baseline updates
+OPEN_FRAC = float(os.environ.get("OPEN_FRAC", 0.80))     # >= this fraction of baseline => fully open (frame 0)
+MID_FRAC  = float(os.environ.get("MID_FRAC", 0.65))      # >= this => mid (frame 1)
+LOW_FRAC  = float(os.environ.get("LOW_FRAC", 0.52))      # >= this => almost closed (frame 2)
+STABLE_FRAMES = int(os.environ.get("STABLE_FRAMES", 2))  # require this many consecutive classifications before committing LED change
 
 # -------------------------------------------------------------------------
 
@@ -107,6 +114,30 @@ def idx(r, prev=None):
 	# prev == 3 (closed)
 	return 0 if r>0.31 else 1 if r>0.25 else 2 if r>0.20 else 3
 
+def classify_dynamic(r: float, baseline: float, prev: int|None) -> int:
+	"""Adaptive classification using relative ratio vs. calibrated open baseline.
+	Applies light hysteresis by nudging thresholds depending on prior state.
+	"""
+	if baseline <= 1e-6:  # fallback if not yet calibrated
+		return idx(r, prev)
+	rel = r / baseline
+	# hysteresis adjustments
+	adj = 0.0
+	if prev == 0:
+		adj = -0.02  # make it a bit easier to leave fully open
+	elif prev == 3:
+		adj = 0.02   # require a bit more to pop open from closed
+	of = max(0.0, min(1.2, OPEN_FRAC + adj))
+	mf = max(0.0, min(of - 0.02, MID_FRAC + adj))
+	lf = max(0.0, min(mf - 0.02, LOW_FRAC + adj))
+	if rel >= of:
+		return 0
+	if rel >= mf:
+		return 1
+	if rel >= lf:
+		return 2
+	return 3
+
 # Initialize USB/Webcam
 cap = cv2.VideoCapture(CAM_INDEX)
 if cap.isOpened():
@@ -132,6 +163,14 @@ last=(-1,-1)
 last_led_time = 0.0
 prev_li = None
 prev_ri = None
+
+# Adaptive baseline & stability tracking
+baseline_l = 0.0
+baseline_r = 0.0
+committed_li = -1
+committed_ri = -1
+li_stable = 0
+ri_stable = 0
 
 if DISABLE_GC:
 	try:
@@ -164,14 +203,40 @@ while True:
 		if 'plr' in globals():
 			lr=plr*(1-SMOOTH_ALPHA)+lr*SMOOTH_ALPHA; rr=prr*(1-SMOOTH_ALPHA)+rr*SMOOTH_ALPHA
 		plr,prr=lr,rr
-		li = idx(lr, prev_li)
-		ri = idx(rr, prev_ri)
+		if DYNAMIC_THRESH:
+			# update baselines when eyes appear open (high ratios) OR baseline uninitialized
+			if lr > baseline_l or baseline_l == 0.0:
+				baseline_l = lr if baseline_l == 0.0 else (baseline_l*(1-BASELINE_ALPHA) + lr*BASELINE_ALPHA)
+			if rr > baseline_r or baseline_r == 0.0:
+				baseline_r = rr if baseline_r == 0.0 else (baseline_r*(1-BASELINE_ALPHA) + rr*BASELINE_ALPHA)
+			li = classify_dynamic(lr, baseline_l, prev_li)
+			ri = classify_dynamic(rr, baseline_r, prev_ri)
+		else:
+			li = idx(lr, prev_li)
+			ri = idx(rr, prev_ri)
 	else:
 		li=ri=0
-	# Rate-limit LED updates and only push on change
-	if (li,ri)!=last and (now - last_led_time) >= LED_MIN_INTERVAL:
+
+	# Stability filtering: require consecutive frames before committing a new state
+	if li != prev_li:
+		li_stable = 1
+	else:
+		li_stable += 1
+	if ri != prev_ri:
+		ri_stable = 1
+	else:
+		ri_stable += 1
+
+	# Commit if stable enough
+	if li_stable >= STABLE_FRAMES:
+		committed_li = li
+	if ri_stable >= STABLE_FRAMES:
+		committed_ri = ri
+
+	# Rate-limit LED updates and only push on change of committed states
+	if (committed_li, committed_ri) != last and (now - last_led_time) >= LED_MIN_INTERVAL and committed_li >=0 and committed_ri >=0:
 		canvas=Image.new("RGBA",(128,32))
-		left=eye_frames[li]; right=eye_frames_flipped[ri]
+		left=eye_frames[committed_li]; right=eye_frames_flipped[committed_ri]
 		canvas.paste(left,(0,0),left); canvas.paste(right,(64,0),right)
 		out = apply_column_filter(canvas)
 		if offscreen is not None:
@@ -182,15 +247,20 @@ while True:
 				matrix.SetImage(out.convert("RGB"))
 		else:
 			matrix.SetImage(out.convert("RGB"))
-		last=(li,ri)
+		last=(committed_li,committed_ri)
 		last_led_time = now
-		prev_li, prev_ri = li, ri
+
+	prev_li, prev_ri = li, ri
 	if not DISABLE_PREVIEW:
 		# Ensure BGR for preview text overlay
 		if frame.shape[2] == 3:  # already BGR for OpenCV source
-			cv2.putText(frame,f"L{li} R{ri}",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),1)
+			label = f"L{committed_li if committed_li>=0 else li} R{committed_ri if committed_ri>=0 else ri}"
+			cv2.putText(frame,label,(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),1)
 			if 'plr' in globals():
-				cv2.putText(frame,f"{plr:.2f}/{prr:.2f}",(10,55),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,0),1)
+				if DYNAMIC_THRESH and baseline_l>0 and baseline_r>0:
+					cv2.putText(frame,f"{plr:.2f}/{prr:.2f} bl:{baseline_l:.2f} br:{baseline_r:.2f}",(10,55),cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,0),1)
+				else:
+					cv2.putText(frame,f"{plr:.2f}/{prr:.2f}",(10,55),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,0),1)
 			cv2.imshow('Eyes',frame)
 			if cv2.waitKey(1)&0xFF==ord('q'): break
 if cap is not None:
