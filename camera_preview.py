@@ -28,18 +28,28 @@ def main() -> None:
     headless = os.environ.get("DISPLAY") is None and os.environ.get("WAYLAND_DISPLAY") is None
 
     if _HAVE_PICAMERA2:
-        picam = Picamera2()
-        RES = (640, 480)
-        cfg = picam.create_video_configuration(main={"size": RES})
-        picam.configure(cfg)
-        # If there is no GUI, use DRM preview (fullscreen on HDMI). Quit with Ctrl+C.
-        if headless:
-            try:
-                picam.start_preview(Preview.DRM)
-                print("Picamera2 DRM preview started (headless). Press Ctrl+C to quit.")
-            except Exception as e:
-                print(f"Failed to start DRM preview: {e}")
-        picam.start()
+        try:
+            # If no CSI cameras are detected, fall back to OpenCV.
+            if not Picamera2.global_camera_info():
+                raise RuntimeError("No Pi cameras detected")
+            picam = Picamera2()
+            RES = (640, 480)
+            cfg = picam.create_video_configuration(main={"size": RES})
+            picam.configure(cfg)
+            if headless:
+                try:
+                    picam.start_preview(Preview.DRM)
+                    print("Picamera2 DRM preview started (headless). Press Ctrl+C to quit.")
+                except Exception as e:
+                    print(f"Failed to start DRM preview: {e}")
+            picam.start()
+        except Exception as e:
+            print(f"Picamera2 unavailable ({e}); falling back to OpenCV (/dev/video0).")
+            picam = None
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("ERROR: Could not open camera. No Pi camera and no /dev/video0.")
+                return
     else:
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
