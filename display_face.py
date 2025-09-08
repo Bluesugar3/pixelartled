@@ -44,10 +44,21 @@ CAM_H = int(os.environ.get("CAM_H", "480"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "30"))
 PROC_SCALE = float(os.environ.get("PROC_SCALE", "1.0"))
 PROC_SCALE = max(0.2, min(1.0, PROC_SCALE))
+
+# Legacy single smoothing factor (still honored if specific ones unset)
 SMOOTH_ALPHA = float(os.environ.get("SMOOTH_ALPHA", "0.3"))
+# New: allow asymmetric smoothing for faster closing (blink) vs opening
+SMOOTH_ALPHA_OPEN = float(os.environ.get("SMOOTH_ALPHA_OPEN", str(SMOOTH_ALPHA)))
+SMOOTH_ALPHA_CLOSE = float(os.environ.get("SMOOTH_ALPHA_CLOSE", "0.75"))
+
 REFINE = os.environ.get("REFINE", "1") == "1"
 SHOW_FPS = os.environ.get("SHOW_FPS", "0") == "1"
 FOURCC_MJPG = os.environ.get("FOURCC_MJPG", "1") == "1"
+
+# Optional fast blink forcing: if enabled and a rapid drop is detected, jump to fully closed frame.
+FAST_BLINK = os.environ.get("FAST_BLINK", "1") == "1"
+BLINK_FORCE_DELTA = float(os.environ.get("BLINK_FORCE_DELTA", "0.05"))  # min drop vs previous to trigger
+BLINK_MAX_RATIO = float(os.environ.get("BLINK_MAX_RATIO", "0.24"))      # raw ratio below this qualifies
 
 # ---------- Assets (eye frames) ----------
 EYE_FILES = ["protogen.png", "protogen1.png", "protogen2.png", "protogen3.png"]
@@ -182,13 +193,28 @@ def run():
 			li, ri = last_li, last_ri
 			if res.multi_face_landmarks:
 				lms = res.multi_face_landmarks[0].landmark
-				lr = eye_ratio(lms, L)
-				rr = eye_ratio(lms, R)
+				raw_lr = eye_ratio(lms, L)
+				raw_rr = eye_ratio(lms, R)
+
 				if plr is not None:
-					lr = plr * (1 - SMOOTH_ALPHA) + lr * SMOOTH_ALPHA
-					rr = prr * (1 - SMOOTH_ALPHA) + rr * SMOOTH_ALPHA
+					# Faster smoothing when closing (raw < prev) to reduce perceived latency.
+					a_l = SMOOTH_ALPHA_CLOSE if raw_lr < plr else SMOOTH_ALPHA_OPEN
+					a_r = SMOOTH_ALPHA_CLOSE if raw_rr < prr else SMOOTH_ALPHA_OPEN
+					lr = plr * (1 - a_l) + raw_lr * a_l
+					rr = prr * (1 - a_r) + raw_rr * a_r
+				else:
+					lr, rr = raw_lr, raw_rr
+
+				# Fast blink override: large rapid drop -> force fully closed frame index (3)
+				forced_li = forced_ri = None
+				if FAST_BLINK and plr is not None and (plr - raw_lr) >= BLINK_FORCE_DELTA and raw_lr <= BLINK_MAX_RATIO:
+					forced_li = 3
+				if FAST_BLINK and prr is not None and (prr - raw_rr) >= BLINK_FORCE_DELTA and raw_rr <= BLINK_MAX_RATIO:
+					forced_ri = 3
+
 				plr, prr = lr, rr
-				li, ri = eye_index(lr), eye_index(rr)
+				li = forced_li if forced_li is not None else eye_index(lr)
+				ri = forced_ri if forced_ri is not None else eye_index(rr)
 
 			if (li, ri) != (last_li, last_ri) and li >= 0 and ri >= 0:
 				canvas = Image.new("RGBA", (128, 32))
