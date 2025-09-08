@@ -69,6 +69,7 @@ BRIGHTNESS = max(1,min(100,int(os.environ.get("LED_BRIGHTNESS","100"))))
 STABILIZE = os.environ.get("STABILIZE","1") == "1"
 STABLE_DELTA = float(os.environ.get("STABLE_DELTA","0.015"))
 ASYM_RATIO = float(os.environ.get("ASYM_RATIO","0.60"))
+SAFE_MODE = os.environ.get("SAFE_MODE","0") == "1"  # disable advanced / potentially unstable features
 
 # Landmark indices (camera -> subject corrected)
 L_IDS = [362,385,387,263,373,380]
@@ -125,7 +126,17 @@ def build_facemesh(refine: bool):
 def main():
 	matrix,off=init_matrix()
 	cap=open_camera()
-	refine_enabled = REFINE  # local mutable state separate from global
+	# Safe mode: turn off advanced features that may contribute to native crashes
+	refine_enabled = REFINE and not SAFE_MODE  # local mutable state separate from global
+	adaptive_allowed = ADAPT_REFINE and not SAFE_MODE
+	use_clahe = CLAHE and not SAFE_MODE
+	use_denoise = DENOISE and not SAFE_MODE
+	threaded_capture = CAPTURE_THREAD and not SAFE_MODE
+	if SAFE_MODE:
+		# In safe mode force moderate processing scale to avoid extreme resizing
+		if PROC_SCALE < 0.5:
+			global PROC_SCALE  # type: ignore
+			PROC_SCALE = 0.5
 	face=build_facemesh(refine_enabled)
 
 	last_proc=0.0
@@ -153,7 +164,7 @@ def main():
 			except Exception: pass
 
 	th=None
-	if CAPTURE_THREAD:
+	if threaded_capture:
 		th=threading.Thread(target=capture_loop,daemon=True)
 		th.start()
 
@@ -162,7 +173,7 @@ def main():
 
 	try:
 		while True:
-			if CAPTURE_THREAD and th is not None:
+			if threaded_capture and th is not None:
 				try:
 					frame=frame_q.get(timeout=1.0)
 					ok=True
@@ -181,17 +192,21 @@ def main():
 					new_w=max(64,int(proc.shape[1]*PROC_SCALE))
 					new_h=max(48,int(proc.shape[0]*PROC_SCALE))
 					proc=cv2.resize(proc,(new_w,new_h),interpolation=cv2.INTER_AREA)
-				if CLAHE:
+				if use_clahe:
 					lab=cv2.cvtColor(proc,cv2.COLOR_BGR2LAB)
 					l,a,b=cv2.split(lab)
 					clahe=cv2.createCLAHE(clipLimit=2.0,tileGridSize=(8,8))
 					l=clahe.apply(l)
 					lab=cv2.merge((l,a,b))
 					proc=cv2.cvtColor(lab,cv2.COLOR_LAB2BGR)
-				if DENOISE:
+				if use_denoise:
 					proc=cv2.bilateralFilter(proc,5,50,50)
 				start_t=time.time()
-				res=face.process(cv2.cvtColor(proc,cv2.COLOR_BGR2RGB))
+				try:
+					res=face.process(cv2.cvtColor(proc,cv2.COLOR_BGR2RGB))
+				except Exception:
+					# If mediapipe internal error, skip this cycle
+					res=None
 				if res and res.multi_face_landmarks:
 					lms=res.multi_face_landmarks[0].landmark
 					lr=eye_ratio(lms,L_IDS); rr=eye_ratio(lms,R_IDS)
@@ -218,13 +233,10 @@ def main():
 				end_t=time.time(); proc_times.append(end_t-start_t)
 				if len(proc_times)>60: proc_times.pop(0)
 				last_proc=now
-				if ADAPT_REFINE and refine_enabled and len(proc_times)>=30:
+				if adaptive_allowed and refine_enabled and len(proc_times)>=30:
 					avg = sum(proc_times)/len(proc_times)
 					if avg > (1.0/max(1.0,TARGET_PROC_FPS))*1.25:
-						try:
-							face.close()
-						except Exception:
-							pass
+						# Rebuild without calling close (can segfault on some ARM builds)
 						refine_enabled = False
 						face = build_facemesh(False)
 						adapt_msg = "refine->off"
@@ -253,11 +265,13 @@ def main():
 					cv2.putText(frame,f"{_fps:4.1f}fps s={PROC_SCALE}",(8,64),cv2.FONT_HERSHEY_SIMPLEX,0.5,(200,200,200),1)
 					if adapt_msg:
 						cv2.putText(frame,adapt_msg,(8,82),cv2.FONT_HERSHEY_SIMPLEX,0.45,(100,200,255),1)
+					if SAFE_MODE:
+						cv2.putText(frame,"SAFE_MODE",(8,100),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,165,255),1)
 				cv2.imshow('Eyes',frame)
 				if cv2.waitKey(1)&0xFF==ord('q'):
 					break
 	finally:
-		if CAPTURE_THREAD and th is not None:
+		if threaded_capture and th is not None:
 			stop_flag=True
 		cap.release(); cv2.destroyAllWindows()
 
