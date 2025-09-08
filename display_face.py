@@ -38,7 +38,7 @@ Environment (optional):
 
 from PIL import Image
 import os, math, time, threading, queue
-import cv2, mediapipe as mp, numpy as np
+import cv2, mediapipe as mp
 from rgbmatrix import RGBMatrix, RGBMatrixOptions
 
 # ---------------- Assets ----------------
@@ -125,7 +125,8 @@ def build_facemesh(refine: bool):
 def main():
 	matrix,off=init_matrix()
 	cap=open_camera()
-	face=build_facemesh(REFINE)
+	refine_enabled = REFINE  # local mutable state separate from global
+	face=build_facemesh(refine_enabled)
 
 	last_proc=0.0
 	last_led=0.0
@@ -137,7 +138,7 @@ def main():
 	_fps=0.0; _frames=0; _t0=time.time()
 
 	# Threaded capture
-	frame_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=1)
+	frame_q: "queue.Queue" = queue.Queue(maxsize=1)
 	stop_flag=False
 
 	def capture_loop():
@@ -217,14 +218,17 @@ def main():
 				end_t=time.time(); proc_times.append(end_t-start_t)
 				if len(proc_times)>60: proc_times.pop(0)
 				last_proc=now
-				if ADAPT_REFINE and REFINE and len(proc_times)>=30:
-					avg=sum(proc_times)/len(proc_times)
+				if ADAPT_REFINE and refine_enabled and len(proc_times)>=30:
+					avg = sum(proc_times)/len(proc_times)
 					if avg > (1.0/max(1.0,TARGET_PROC_FPS))*1.25:
-						try: face.close()
-						except Exception: pass
-						REFINE=False
-						face=build_facemesh(False)
-						adapt_msg="refine->off"; proc_times.clear()
+						try:
+							face.close()
+						except Exception:
+							pass
+						refine_enabled = False
+						face = build_facemesh(False)
+						adapt_msg = "refine->off"
+						proc_times.clear()
 
 			if (li,ri)!=last and (now-last_led)>=LED_INTERVAL:
 				img=compose(li,ri)
@@ -250,7 +254,8 @@ def main():
 					if adapt_msg:
 						cv2.putText(frame,adapt_msg,(8,82),cv2.FONT_HERSHEY_SIMPLEX,0.45,(100,200,255),1)
 				cv2.imshow('Eyes',frame)
-				if cv2.waitKey(1)&0xFF==ord('q'): break
+				if cv2.waitKey(1)&0xFF==ord('q'):
+					break
 	finally:
 		if CAPTURE_THREAD and th is not None:
 			stop_flag=True
