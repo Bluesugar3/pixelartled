@@ -68,3 +68,8 @@ while True:
 	draw()
 
 print('GAME OVER. Final score:',score)
+
+
+
+
+

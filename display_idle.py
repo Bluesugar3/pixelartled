@@ -67,6 +67,14 @@ def apply_column_filter(img: Image.Image) -> Image.Image:
     return im
 
 
+# Blink timing (tunable via env)
+# Shorter BLINK_STEP_SEC -> faster blink animation
+BLINK_STEP_SEC = float(os.environ.get("BLINK_STEP_SEC", "0.03"))  # default was 0.065
+# Longer interval range between blinks
+BLINK_INTERVAL_MIN = float(os.environ.get("BLINK_INTERVAL_MIN", "10.0"))
+BLINK_INTERVAL_MAX = float(os.environ.get("BLINK_INTERVAL_MAX", "50.0"))
+
+
 def main() -> None:
     files = ["protogen.png", "protogen1.png", "protogen2.png", "protogen3.png"]
     eye_frames = load_eye_frames(files)  # 0=open, 1..3=blink frames
@@ -96,16 +104,16 @@ def main() -> None:
     open_idx = 0
     sequence = [1, 2, 3, 2, 1, 0]
     try:
-        next_blink = time.time() + random.uniform(2.5, 6.0)
+        next_blink = time.time() + random.uniform(BLINK_INTERVAL_MIN, BLINK_INTERVAL_MAX)
         show_frame(open_idx)
         while True:
             now = time.time()
             if now >= next_blink:
                 for idx in sequence:
                     show_frame(idx)
-                    time.sleep(0.065)
+                    time.sleep(BLINK_STEP_SEC)
                 # schedule next blink
-                next_blink = time.time() + random.uniform(2.5, 6.0)
+                next_blink = time.time() + random.uniform(BLINK_INTERVAL_MIN, BLINK_INTERVAL_MAX)
             else:
                 # Idle update cadence
                 time.sleep(0.05)
