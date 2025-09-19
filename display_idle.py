@@ -23,11 +23,18 @@ from PIL import Image
 from rgbmatrix import RGBMatrix, RGBMatrixOptions
 
 
+# Load assets from the script’s directory by default (override with ASSET_DIR env)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSET_DIR = os.environ.get("ASSET_DIR", SCRIPT_DIR)
+
+
 def load_eye_frames(files: List[str]) -> List[Image.Image]:
     frames: List[Image.Image] = []
     for f in files:
         if not os.path.exists(f):
             print(f"Missing image: {f}")
+            print(f"Working dir: {os.getcwd()}")
+            print(f"ASSET_DIR: {ASSET_DIR}")
             sys.exit(1)
         frames.append(Image.open(f).convert("RGBA"))
     # Basic validation
@@ -76,7 +83,10 @@ BLINK_INTERVAL_MAX = float(os.environ.get("BLINK_INTERVAL_MAX", "50.0"))
 
 
 def main() -> None:
-    files = ["protogen.png", "protogen1.png", "protogen2.png", "protogen3.png"]
+    files = [
+        os.path.join(ASSET_DIR, n)
+        for n in ["protogen.png", "protogen1.png", "protogen2.png", "protogen3.png"]
+    ]
     eye_frames = load_eye_frames(files)  # 0=open, 1..3=blink frames
 
     # Matrix options
